@@ -6231,21 +6231,7 @@ impl<'a> Parser<'a> {
                 ensure_not_set(&body.support, "SUPPORT")?;
                 body.support = Some(self.parse_object_name(false)?);
             } else if self.parse_keyword(Keyword::SET) {
-                let name = self.parse_object_name(false)?;
-                let value = if self.parse_keywords(&[Keyword::FROM, Keyword::CURRENT]) {
-                    FunctionSetValue::FromCurrent
-                } else {
-                    if !self.consume_token(&Token::Eq) && !self.parse_keyword(Keyword::TO) {
-                        return self.expected_ref("= or TO", self.peek_token_ref());
-                    }
-                    if self.parse_keyword(Keyword::DEFAULT) {
-                        FunctionSetValue::Default
-                    } else {
-                        let values = self.parse_comma_separated(Parser::parse_expr)?;
-                        FunctionSetValue::Values(values)
-                    }
-                };
-                set_params.push(FunctionDefinitionSetParam { name, value });
+                set_params.push(self.parse_function_definition_set_param()?);
             } else if self.parse_keyword(Keyword::RETURN) {
                 ensure_not_set(&body.function_body, "RETURN")?;
                 body.function_body = Some(CreateFunctionBody::Return(self.parse_expr()?));
@@ -12011,6 +11997,7 @@ impl<'a> Parser<'a> {
             }
             Keyword::TYPE => self.parse_alter_type(),
             Keyword::COLLATION => self.parse_alter_collation().map(Into::into),
+            Keyword::DATABASE => self.parse_alter_database().map(Into::into),
             Keyword::TABLE => self.parse_alter_table(None),
             Keyword::ICEBERG => {
                 self.expect_keyword(Keyword::TABLE)?;
@@ -12060,7 +12047,7 @@ impl<'a> Parser<'a> {
             _ => {
                 self.index = index;
                 self.expected_ref(
-                    "one of VIEW or MATERIALIZED VIEW or TYPE or COLLATION or TABLE or INDEX or FUNCTION or AGGREGATE or ROLE or POLICY or TRIGGER or CONNECTOR or ICEBERG or FOREIGN TABLE or SCHEMA or USER or OPERATOR",
+                    "one of VIEW or MATERIALIZED VIEW or TYPE or COLLATION or DATABASE or TABLE or INDEX or FUNCTION or AGGREGATE or ROLE or POLICY or TRIGGER or CONNECTOR or ICEBERG or FOREIGN TABLE or SCHEMA or USER or OPERATOR",
                     self.peek_token_ref(),
                 )
             }
@@ -12180,23 +12167,9 @@ impl<'a> Parser<'a> {
         } else if self.parse_keyword(Keyword::SUPPORT) {
             Some(AlterFunctionAction::Support(self.parse_object_name(false)?))
         } else if self.parse_keyword(Keyword::SET) {
-            let name = self.parse_object_name(false)?;
-            let value = if self.parse_keywords(&[Keyword::FROM, Keyword::CURRENT]) {
-                FunctionSetValue::FromCurrent
-            } else {
-                if !self.consume_token(&Token::Eq) && !self.parse_keyword(Keyword::TO) {
-                    return self.expected_ref("= or TO", self.peek_token_ref());
-                }
-                if self.parse_keyword(Keyword::DEFAULT) {
-                    FunctionSetValue::Default
-                } else {
-                    FunctionSetValue::Values(self.parse_comma_separated(Parser::parse_expr)?)
-                }
-            };
-            Some(AlterFunctionAction::Set(FunctionDefinitionSetParam {
-                name,
-                value,
-            }))
+            Some(AlterFunctionAction::Set(
+                self.parse_function_definition_set_param()?,
+            ))
         } else if self.parse_keyword(Keyword::RESET) {
             let reset_config = if self.parse_keyword(Keyword::ALL) {
                 ResetConfig::ALL
@@ -12209,6 +12182,27 @@ impl<'a> Parser<'a> {
         };
 
         Ok(action)
+    }
+
+    /// Parse `configuration_parameter { TO | = } { value [, ...] | DEFAULT }` or
+    /// `configuration_parameter FROM CURRENT`, after `SET`.
+    fn parse_function_definition_set_param(
+        &mut self,
+    ) -> Result<FunctionDefinitionSetParam, ParserError> {
+        let name = self.parse_object_name(false)?;
+        let value = if self.parse_keywords(&[Keyword::FROM, Keyword::CURRENT]) {
+            FunctionSetValue::FromCurrent
+        } else {
+            if !self.consume_token(&Token::Eq) && !self.parse_keyword(Keyword::TO) {
+                return self.expected_ref("= or TO", self.peek_token_ref());
+            }
+            if self.parse_keyword(Keyword::DEFAULT) {
+                FunctionSetValue::Default
+            } else {
+                FunctionSetValue::Values(self.parse_comma_separated(Parser::parse_expr)?)
+            }
+        };
+        Ok(FunctionDefinitionSetParam { name, value })
     }
 
     fn parse_alter_function_actions(
@@ -12491,6 +12485,102 @@ impl<'a> Parser<'a> {
         };
 
         Ok(AlterCollation { name, operation })
+    }
+
+    /// Parse a [Statement::AlterDatabase].
+    ///
+    /// [PostgreSQL Documentation](https://www.postgresql.org/docs/current/sql-alterdatabase.html)
+    pub fn parse_alter_database(&mut self) -> Result<AlterDatabase, ParserError> {
+        let name = self.parse_object_name(false)?;
+        let operation = if self.parse_keywords(&[Keyword::RENAME, Keyword::TO]) {
+            AlterDatabaseOperation::RenameTo {
+                new_name: self.parse_identifier()?,
+            }
+        } else if self.parse_keywords(&[Keyword::OWNER, Keyword::TO]) {
+            AlterDatabaseOperation::OwnerTo(self.parse_owner()?)
+        } else if self.parse_keywords(&[Keyword::REFRESH, Keyword::COLLATION, Keyword::VERSION]) {
+            AlterDatabaseOperation::RefreshCollationVersion
+        } else if self.parse_keyword(Keyword::SET) {
+            if self.parse_special_set_keyword(Keyword::TABLESPACE) {
+                AlterDatabaseOperation::SetTablespace {
+                    tablespace_name: self.parse_identifier()?,
+                }
+            } else {
+                AlterDatabaseOperation::Set(self.parse_configuration_set()?)
+            }
+        } else if self.parse_keyword(Keyword::RESET) {
+            AlterDatabaseOperation::Reset(if self.parse_keyword(Keyword::ALL) {
+                ResetConfig::ALL
+            } else {
+                ResetConfig::ConfigName(self.parse_object_name(false)?)
+            })
+        } else {
+            let with = self.parse_keyword(Keyword::WITH);
+            let mut options = vec![];
+            while let Some(option) = self.parse_alter_database_option()? {
+                options.push(option);
+            }
+            AlterDatabaseOperation::Options { with, options }
+        };
+
+        Ok(AlterDatabase { name, operation })
+    }
+
+    fn parse_alter_database_option(&mut self) -> Result<Option<AlterDatabaseOption>, ParserError> {
+        let name = if self.parse_keyword(Keyword::CONNECTION) {
+            self.expect_keyword_is(Keyword::LIMIT)?;
+            AlterDatabaseOptionName::ConnectionLimit
+        } else if matches!(self.peek_token_ref().token, Token::Word(_)) {
+            AlterDatabaseOptionName::Name(self.parse_identifier()?)
+        } else {
+            return Ok(None);
+        };
+        let _ = self.consume_token(&Token::Eq);
+        let value = self.parse_expr()?;
+        Ok(Some(AlterDatabaseOption { name, value }))
+    }
+
+    /// Parse the clause after `SET` that stores a configuration parameter
+    /// default, as in `ALTER DATABASE ... SET`.
+    ///
+    /// [PostgreSQL Documentation](https://www.postgresql.org/docs/current/sql-set.html)
+    fn parse_configuration_set(&mut self) -> Result<ConfigurationSet, ParserError> {
+        let set = if self.parse_keywords(&[Keyword::TIME, Keyword::ZONE]) {
+            ConfigurationSet::TimeZone(self.parse_expr()?)
+        } else if self.parse_special_set_keyword(Keyword::SCHEMA) {
+            ConfigurationSet::Schema(self.parse_value()?)
+        } else if self.parse_special_set_keyword(Keyword::ROLE) {
+            ConfigurationSet::Role(self.parse_identifier()?)
+        } else if self.parse_special_set_keyword(Keyword::NAMES) {
+            ConfigurationSet::Names(self.maybe_parse(|parser| parser.parse_expr())?)
+        } else if self.parse_keywords(&[Keyword::SESSION, Keyword::AUTHORIZATION]) {
+            ConfigurationSet::SessionAuthorization(if self.parse_keyword(Keyword::DEFAULT) {
+                SetSessionAuthorizationParamKind::Default
+            } else {
+                SetSessionAuthorizationParamKind::User(self.parse_identifier()?)
+            })
+        } else if self.parse_keywords(&[Keyword::XML, Keyword::OPTION]) {
+            ConfigurationSet::XmlOption(
+                match self.expect_one_of_keywords(&[Keyword::DOCUMENT, Keyword::CONTENT])? {
+                    Keyword::DOCUMENT => XmlOption::Document,
+                    _ => XmlOption::Content,
+                },
+            )
+        } else {
+            ConfigurationSet::Parameter(self.parse_function_definition_set_param()?)
+        };
+        Ok(set)
+    }
+
+    /// Consume `keyword` unless it names the parameter of a
+    /// `SET name { TO | = | FROM CURRENT }` assignment.
+    fn parse_special_set_keyword(&mut self, keyword: Keyword) -> bool {
+        let assignment_follows = match &self.peek_nth_token_ref(1).token {
+            Token::Eq => true,
+            Token::Word(w) => matches!(w.keyword, Keyword::TO | Keyword::FROM),
+            _ => false,
+        };
+        !assignment_follows && self.parse_keyword(keyword)
     }
 
     /// Parse a [Statement::AlterOperator]

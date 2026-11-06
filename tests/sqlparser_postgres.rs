@@ -13430,3 +13430,153 @@ fn display_maintain_privilege_propagates_formatter_errors() {
         Err(fmt::Error)
     );
 }
+
+#[test]
+fn parse_alter_database() {
+    let dialects = pg_and_generic();
+
+    let stmt = dialects.verified_stmt("ALTER DATABASE tzq SET timezone = 'Asia/Tokyo'");
+    assert_eq!(
+        stmt,
+        Statement::AlterDatabase(AlterDatabase {
+            name: ObjectName::from(vec![Ident::new("tzq")]),
+            operation: AlterDatabaseOperation::Set(ConfigurationSet::Parameter(
+                FunctionDefinitionSetParam {
+                    name: ObjectName::from(vec![Ident::new("timezone")]),
+                    value: FunctionSetValue::Values(vec![Expr::Value(
+                        Value::SingleQuotedString("Asia/Tokyo".to_string()).with_empty_span()
+                    )]),
+                }
+            )),
+        })
+    );
+
+    let stmt = dialects.verified_stmt("ALTER DATABASE tzq SET TIME ZONE 'Europe/Rome'");
+    assert_eq!(
+        stmt,
+        Statement::AlterDatabase(AlterDatabase {
+            name: ObjectName::from(vec![Ident::new("tzq")]),
+            operation: AlterDatabaseOperation::Set(ConfigurationSet::TimeZone(Expr::Value(
+                Value::SingleQuotedString("Europe/Rome".to_string()).with_empty_span()
+            ))),
+        })
+    );
+
+    let stmt = dialects.verified_stmt(
+        "ALTER DATABASE d WITH allow_connections true CONNECTION LIMIT -1 \"is_template\" false",
+    );
+    assert_eq!(
+        stmt,
+        Statement::AlterDatabase(AlterDatabase {
+            name: ObjectName::from(vec![Ident::new("d")]),
+            operation: AlterDatabaseOperation::Options {
+                with: true,
+                options: vec![
+                    AlterDatabaseOption {
+                        name: AlterDatabaseOptionName::Name(Ident::new("allow_connections")),
+                        value: Expr::Value(Value::Boolean(true).with_empty_span()),
+                    },
+                    AlterDatabaseOption {
+                        name: AlterDatabaseOptionName::ConnectionLimit,
+                        value: Expr::UnaryOp {
+                            op: UnaryOperator::Minus,
+                            expr: Box::new(Expr::value(number("1"))),
+                        },
+                    },
+                    AlterDatabaseOption {
+                        name: AlterDatabaseOptionName::Name(Ident::with_quote('"', "is_template")),
+                        value: Expr::Value(Value::Boolean(false).with_empty_span()),
+                    },
+                ],
+            },
+        })
+    );
+
+    // ROLE is both a `SET ROLE` form and an ordinary configuration parameter.
+    let role_set = |sql| match dialects.verified_stmt(sql) {
+        Statement::AlterDatabase(AlterDatabase {
+            operation: AlterDatabaseOperation::Set(set),
+            ..
+        }) => set,
+        _ => unreachable!(),
+    };
+    assert!(matches!(
+        role_set("ALTER DATABASE d SET ROLE r"),
+        ConfigurationSet::Role(_)
+    ));
+    assert!(matches!(
+        role_set("ALTER DATABASE d SET role = r"),
+        ConfigurationSet::Parameter(_)
+    ));
+    assert!(matches!(
+        role_set("ALTER DATABASE d SET role FROM CURRENT"),
+        ConfigurationSet::Parameter(_)
+    ));
+
+    for sql in [
+        "ALTER DATABASE d",
+        "ALTER DATABASE d WITH",
+        "ALTER DATABASE d ALLOW_CONNECTIONS DEFAULT",
+        "ALTER DATABASE d TABLESPACE pg_default",
+        "ALTER DATABASE d OWNER r",
+        "ALTER DATABASE d RENAME TO \"Weird\"",
+        "ALTER DATABASE d OWNER TO CURRENT_USER",
+        "ALTER DATABASE d SET TABLESPACE pg_default",
+        "ALTER DATABASE d SET tablespace = x",
+        "ALTER DATABASE d REFRESH COLLATION VERSION",
+        "ALTER DATABASE d SET search_path = \"$user\", public",
+        "ALTER DATABASE d SET timezone = DEFAULT",
+        "ALTER DATABASE d SET TIME ZONE LOCAL",
+        "ALTER DATABASE d SET TIME ZONE INTERVAL '+01:00' HOUR TO MINUTE",
+        "ALTER DATABASE d SET SCHEMA 'x'",
+        "ALTER DATABASE d SET NAMES",
+        "ALTER DATABASE d SET NAMES 'UTF8'",
+        "ALTER DATABASE d SET SESSION AUTHORIZATION DEFAULT",
+        "ALTER DATABASE d SET SESSION AUTHORIZATION r",
+        "ALTER DATABASE d SET XML OPTION DOCUMENT",
+        "ALTER DATABASE d SET XML OPTION CONTENT",
+        "ALTER DATABASE d RESET my.custom",
+        "ALTER DATABASE d RESET ALL",
+    ] {
+        dialects.verified_stmt(sql);
+    }
+
+    dialects.one_statement_parses_to(
+        "ALTER DATABASE d SET timezone TO 'UTC'",
+        "ALTER DATABASE d SET timezone = 'UTC'",
+    );
+    dialects.one_statement_parses_to(
+        "ALTER DATABASE d CONNECTION LIMIT = 5 tablespace = pg_default",
+        "ALTER DATABASE d CONNECTION LIMIT 5 tablespace pg_default",
+    );
+
+    for (sql, error) in [
+        (
+            "ALTER DATABASE d SET timezone",
+            "Expected: = or TO, found: EOF",
+        ),
+        (
+            "ALTER DATABASE d SET XML OPTION yes",
+            "Expected: one of DOCUMENT or CONTENT, found: yes",
+        ),
+        ("ALTER DATABASE d CONNECTION 5", "Expected: LIMIT, found: 5"),
+        (
+            "ALTER DATABASE d IS_TEMPLATE",
+            "Expected: an expression, found: EOF",
+        ),
+        (
+            "ALTER DATABASE d 'x' 1",
+            "Expected: end of statement, found: 'x'",
+        ),
+        (
+            "ALTER DATABASE d SET TIME ZONE 'UTC', 'x'",
+            "Expected: end of statement, found: ,",
+        ),
+    ] {
+        assert_eq!(
+            dialects.parse_sql_statements(sql).unwrap_err(),
+            ParserError::ParserError(error.to_string()),
+            "{sql}"
+        );
+    }
+}

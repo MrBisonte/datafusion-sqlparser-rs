@@ -48,10 +48,10 @@ use crate::ast::{
     FunctionParallel, FunctionSecurity, HiveDistributionStyle, HiveFormat, HiveIOFormat,
     HiveRowFormat, HiveSetLocation, Ident, InitializeKind, MySQLColumnPosition, ObjectName,
     OnCommit, OneOrManyWithParens, OperateFunctionArg, OrderByExpr, ProjectionSelect, Query,
-    RefreshModeKind, ResetConfig, RowAccessPolicy, SequenceOptions, Spanned, SqlOption, Statement,
-    StorageLifecyclePolicy, StorageSerializationPolicy, TableVersion, Tag, TriggerEvent,
-    TriggerExecBody, TriggerObject, TriggerPeriod, TriggerReferencing, Value, ValueWithSpan,
-    WrappedCollection,
+    RefreshModeKind, ResetConfig, RowAccessPolicy, SequenceOptions,
+    SetSessionAuthorizationParamKind, Spanned, SqlOption, Statement, StorageLifecyclePolicy,
+    StorageSerializationPolicy, TableVersion, Tag, TriggerEvent, TriggerExecBody, TriggerObject,
+    TriggerPeriod, TriggerReferencing, Value, ValueWithSpan, WrappedCollection,
 };
 use crate::display_utils::{DisplayCommaSeparated, Indent, NewLine, SpaceOrNewline};
 use crate::keywords::Keyword;
@@ -5000,6 +5000,205 @@ impl fmt::Display for AlterCollation {
 impl Spanned for AlterCollation {
     fn span(&self) -> Span {
         Span::empty()
+    }
+}
+
+/// `ALTER DATABASE` statement.
+///
+/// [PostgreSQL](https://www.postgresql.org/docs/current/sql-alterdatabase.html)
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct AlterDatabase {
+    /// Name of the database being altered.
+    pub name: ObjectName,
+    /// The operation to perform on the database.
+    pub operation: AlterDatabaseOperation,
+}
+
+/// Operations supported by `ALTER DATABASE`.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum AlterDatabaseOperation {
+    /// `[ WITH ] option [ ... ]`, where the list may be empty.
+    Options {
+        /// Whether the `WITH` keyword was present.
+        with: bool,
+        /// The options to change.
+        options: Vec<AlterDatabaseOption>,
+    },
+    /// `RENAME TO new_name`
+    RenameTo {
+        /// New database name.
+        new_name: Ident,
+    },
+    /// `OWNER TO new_owner`
+    OwnerTo(Owner),
+    /// `SET TABLESPACE new_tablespace`
+    SetTablespace {
+        /// Target tablespace name.
+        tablespace_name: Ident,
+    },
+    /// `REFRESH COLLATION VERSION`
+    RefreshCollationVersion,
+    /// `SET ...`, stored as the database's default for a configuration parameter.
+    Set(ConfigurationSet),
+    /// `RESET configuration_parameter` or `RESET ALL`
+    Reset(ResetConfig),
+}
+
+impl AlterDatabaseOperation {
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Options { with: false, options } if options.is_empty())
+    }
+}
+
+impl fmt::Display for AlterDatabaseOperation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AlterDatabaseOperation::Options { with, options } => {
+                if *with {
+                    f.write_str("WITH")?;
+                    if !options.is_empty() {
+                        f.write_str(" ")?;
+                    }
+                }
+                write!(f, "{}", display_separated(options, " "))
+            }
+            AlterDatabaseOperation::RenameTo { new_name } => write!(f, "RENAME TO {new_name}"),
+            AlterDatabaseOperation::OwnerTo(owner) => write!(f, "OWNER TO {owner}"),
+            AlterDatabaseOperation::SetTablespace { tablespace_name } => {
+                write!(f, "SET TABLESPACE {tablespace_name}")
+            }
+            AlterDatabaseOperation::RefreshCollationVersion => {
+                f.write_str("REFRESH COLLATION VERSION")
+            }
+            AlterDatabaseOperation::Set(set) => write!(f, "{set}"),
+            AlterDatabaseOperation::Reset(ResetConfig::ALL) => f.write_str("RESET ALL"),
+            AlterDatabaseOperation::Reset(ResetConfig::ConfigName(name)) => {
+                write!(f, "RESET {name}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for AlterDatabase {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "ALTER DATABASE {}", self.name)?;
+        if !self.operation.is_empty() {
+            write!(f, " {}", self.operation)?;
+        }
+        Ok(())
+    }
+}
+
+impl Spanned for AlterDatabase {
+    fn span(&self) -> Span {
+        Span::empty()
+    }
+}
+
+/// An option of `ALTER DATABASE ... [ WITH ] option`, such as
+/// `ALLOW_CONNECTIONS true`, `CONNECTION LIMIT 5` or `IS_TEMPLATE false`.
+///
+/// The name is kept as written, since PostgreSQL's grammar accepts any
+/// identifier here and only the server checks it.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct AlterDatabaseOption {
+    /// Option name.
+    pub name: AlterDatabaseOptionName,
+    /// Option value.
+    pub value: Expr,
+}
+
+impl fmt::Display for AlterDatabaseOption {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{} {}", self.name, self.value)
+    }
+}
+
+/// Name of an [`AlterDatabaseOption`].
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum AlterDatabaseOptionName {
+    /// `CONNECTION LIMIT`
+    ConnectionLimit,
+    /// Any other option name, such as `ALLOW_CONNECTIONS`.
+    Name(Ident),
+}
+
+impl fmt::Display for AlterDatabaseOptionName {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AlterDatabaseOptionName::ConnectionLimit => f.write_str("CONNECTION LIMIT"),
+            AlterDatabaseOptionName::Name(name) => write!(f, "{name}"),
+        }
+    }
+}
+
+/// A `SET` clause that stores a configuration parameter default, as in
+/// `ALTER DATABASE ... SET`.
+///
+/// [PostgreSQL](https://www.postgresql.org/docs/current/sql-set.html)
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum ConfigurationSet {
+    /// `SET configuration_parameter { TO | = } { value [, ...] | DEFAULT }`
+    /// or `SET configuration_parameter FROM CURRENT`
+    Parameter(FunctionDefinitionSetParam),
+    /// `SET TIME ZONE { value | LOCAL | DEFAULT }`
+    TimeZone(Expr),
+    /// `SET SCHEMA 'schema'`
+    Schema(ValueWithSpan),
+    /// `SET ROLE role_name`
+    Role(Ident),
+    /// `SET NAMES [ encoding | DEFAULT ]`
+    Names(Option<Expr>),
+    /// `SET SESSION AUTHORIZATION { user_name | DEFAULT }`
+    SessionAuthorization(SetSessionAuthorizationParamKind),
+    /// `SET XML OPTION { DOCUMENT | CONTENT }`
+    XmlOption(XmlOption),
+}
+
+impl fmt::Display for ConfigurationSet {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ConfigurationSet::Parameter(param) => write!(f, "{param}"),
+            ConfigurationSet::TimeZone(value) => write!(f, "SET TIME ZONE {value}"),
+            ConfigurationSet::Schema(schema) => write!(f, "SET SCHEMA {schema}"),
+            ConfigurationSet::Role(role_name) => write!(f, "SET ROLE {role_name}"),
+            ConfigurationSet::Names(None) => f.write_str("SET NAMES"),
+            ConfigurationSet::Names(Some(encoding)) => write!(f, "SET NAMES {encoding}"),
+            ConfigurationSet::SessionAuthorization(kind) => {
+                write!(f, "SET SESSION AUTHORIZATION {kind}")
+            }
+            ConfigurationSet::XmlOption(option) => write!(f, "SET XML OPTION {option}"),
+        }
+    }
+}
+
+/// Value of `SET XML OPTION`.
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum XmlOption {
+    /// `DOCUMENT`
+    Document,
+    /// `CONTENT`
+    Content,
+}
+
+impl fmt::Display for XmlOption {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            XmlOption::Document => "DOCUMENT",
+            XmlOption::Content => "CONTENT",
+        })
     }
 }
 
